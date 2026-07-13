@@ -420,6 +420,41 @@ def _save_one_product_from_row(
             st.info("如果弹出浏览器要求登录或验证，请先手动完成，再点一次保存。")
 
 
+def _render_manual_asset_saver(st: Any, *, title_hint: str = "") -> None:
+    """Fallback learner flow when server-side Xianyu search is blocked."""
+    with st.expander("搜不到结果？可以粘贴商品链接直接保存素材", expanded=False):
+        st.write("如果搜索一直是 0，先让学员在闲鱼里自己找到商品，然后把商品链接粘贴到这里。")
+        item_url = st.text_input(
+            "粘贴闲鱼商品链接",
+            placeholder="例如：https://www.goofish.com/item?id=...",
+            key="manual_item_url",
+        ).strip()
+        manual_title = st.text_input(
+            "商品名称，可不填",
+            value=title_hint,
+            placeholder="不填也可以，系统会尽量从页面识别",
+            key="manual_title_hint",
+        ).strip()
+        if st.button("保存这个链接的文案和图片", key="manual_save_asset"):
+            if not item_url:
+                st.warning("请先粘贴一个闲鱼商品链接。")
+                return
+            try:
+                with st.spinner("正在打开商品详情页并保存素材，请稍等……"):
+                    message = save_product_assets_for_streamlit(
+                        item_url,
+                        manual_title or title_hint or "商品素材",
+                    )
+                st.success(message or "已保存文案和图片。")
+                folder_path = parse_saved_folder_from_message(message)
+                if folder_path:
+                    st.session_state["last_saved_folder"] = folder_path
+                    st.code(folder_path)
+            except Exception as exc:
+                st.error(f"保存失败：{exc}")
+                st.info("如果这个链接也保存失败，通常说明闲鱼详情页也要求登录/验证，需要换本地采集或人工复制方案。")
+
+
 def _render_student_assistant(st: Any, pd: Any) -> None:
     st.header("闲鱼选品助手")
     st.caption("输入商品词，点搜索，看到热度商品后保存文案和图片。")
@@ -449,12 +484,22 @@ def _render_student_assistant(st: Any, pd: Any) -> None:
             try:
                 with st.spinner("正在打开闲鱼搜索并采集前几条结果，请稍等……"):
                     item_count, candidate_count = run_student_keyword_search_for_streamlit(keyword, limit)
-                st.session_state["student_last_success_keyword"] = keyword
-                st.success(f"搜索完成：找到 {item_count} 条结果。")
+                if item_count <= 0:
+                    st.session_state["student_last_success_keyword"] = keyword
+                    st.warning(
+                        "没有抓到商品结果。一般不是商品不存在，而是闲鱼对云服务器访问要求登录、验证，"
+                        "或临时限制了采集。"
+                    )
+                    st.info("可以先用下面的“粘贴商品链接直接保存素材”继续用。")
+                else:
+                    st.session_state["student_last_success_keyword"] = keyword
+                    st.success(f"搜索完成：找到 {item_count} 条结果。")
             except Exception as exc:
                 st.error(f"搜索失败：{exc}")
                 st.info("如果浏览器要求登录或验证，请完成后再点一次搜索。")
                 return
+
+    _render_manual_asset_saver(st, title_hint=keyword)
 
     if not keyword:
         st.info("输入关键词后点击搜索。")
@@ -470,7 +515,7 @@ def _render_student_assistant(st: Any, pd: Any) -> None:
 
     rows = [dict(row) for row in query_student_results(keyword)]
     if not rows:
-        st.info("还没有这个商品的数据。点击上面的“第 2 步：开始搜索”。")
+        st.info("暂时没有自动搜索结果。可以先用上面的“粘贴商品链接直接保存素材”。")
         return
 
     st.subheader(f"第 3 步：查看“{keyword}”的热度结果")
