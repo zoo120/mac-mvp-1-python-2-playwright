@@ -5,7 +5,7 @@ echo "开始安装 Docker 和常用工具..."
 
 if command -v apt-get >/dev/null 2>&1; then
   sudo apt-get update
-  sudo apt-get install -y ca-certificates curl git docker.io docker-compose-plugin
+  sudo apt-get install -y ca-certificates curl git docker.io docker-compose
 elif command -v yum >/dev/null 2>&1; then
   sudo yum install -y git yum-utils
   curl -fsSL https://get.docker.com | sudo sh
@@ -19,3 +19,8 @@ sudo systemctl start docker
 
 echo "Docker 安装完成。"
 sudo docker --version
+if command -v docker-compose >/dev/null 2>&1; then
+  docker-compose --version
+elif sudo docker compose version >/dev/null 2>&1; then
+  sudo docker compose version
+fi

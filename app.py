@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import sys
 import socket
+import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,38 @@ def get_local_lan_ip() -> str:
 def build_lan_url(ip_address: str, port: int = DEFAULT_PORT) -> str:
     value = str(ip_address or "").strip() or "127.0.0.1"
     return f"http://{value}:{int(port)}"
+
+
+def is_online_deployment() -> bool:
+    """Whether the app is running on the public server deployment."""
+    return any(
+        os.getenv(name)
+        for name in (
+            "XIANYU_DB_PATH",
+            "XIANYU_SAVED_PRODUCTS_DIR",
+            "XIANYU_PROFILE_DIR",
+            "XIANYU_LOG_DIR",
+            "XIANYU_HEADLESS",
+        )
+    )
+
+
+def render_student_usage_help(st: Any) -> None:
+    if is_online_deployment():
+        st.write("这是线上版。把浏览器地址栏里的公网网址发给学员即可。")
+        st.info(
+            "给学员发的地址应该类似：http://你的公网IP。"
+            "不要发 localhost，也不要发 172. 开头的内网地址。"
+        )
+        return
+
+    lan_url = build_lan_url(get_local_lan_ip())
+    st.write("这是本地版，只适合你自己电脑测试。")
+    st.write("你自己打开：")
+    st.code(build_lan_url("localhost"))
+    st.write("如果学员和你在同一个 Wi‑Fi，临时测试可以打开：")
+    st.code(lan_url)
+    st.warning("全国学员使用必须部署到云服务器，然后发公网地址。")
 
 
 def parse_saved_folder_from_message(message: str) -> str:
@@ -392,10 +425,7 @@ def _render_student_assistant(st: Any, pd: Any) -> None:
     st.caption("输入商品词，点搜索，看到热度商品后保存文案和图片。")
 
     with st.expander("给学员怎么用？点这里看", expanded=False):
-        lan_url = build_lan_url(get_local_lan_ip())
-        st.write("如果学员和你在同一个 Wi‑Fi，可以让学员打开这个地址：")
-        st.code(lan_url)
-        st.write("如果学员不在同一个 Wi‑Fi，这个地址打不开，需要后续部署成真正线上版。")
+        render_student_usage_help(st)
 
     columns = st.columns([3, 1])
     keyword = columns[0].text_input(
@@ -681,10 +711,15 @@ def main() -> None:
     st.title("闲鱼选品助手")
     admin_mode = st.sidebar.toggle("显示管理员功能", value=False)
     st.sidebar.caption("默认给学员使用；管理员功能请打开上方开关。")
-    st.sidebar.write("本机打开：")
-    st.sidebar.code(build_lan_url("localhost"))
-    st.sidebar.write("同 Wi‑Fi 学员打开：")
-    st.sidebar.code(build_lan_url(get_local_lan_ip()))
+    if is_online_deployment():
+        st.sidebar.success("线上版运行中")
+        st.sidebar.write("发给学员：浏览器地址栏里的公网网址")
+        st.sidebar.warning("不要发 localhost，也不要发 172. 开头的内网地址。")
+    else:
+        st.sidebar.write("本机打开：")
+        st.sidebar.code(build_lan_url("localhost"))
+        st.sidebar.write("同 Wi‑Fi 临时测试：")
+        st.sidebar.code(build_lan_url(get_local_lan_ip()))
 
     if not admin_mode:
         _render_student_assistant(st, pd)

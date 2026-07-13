@@ -34,10 +34,11 @@
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y ca-certificates curl git docker.io docker-compose-plugin
+sudo apt-get install -y ca-certificates curl git docker.io docker-compose
 sudo systemctl enable docker
 sudo systemctl start docker
 sudo docker --version
+docker-compose --version
 ```
 
 如果最后能看到 Docker 版本号，说明安装成功。
@@ -85,7 +86,7 @@ cd /opt/xianyu-student-assistant
 启动：
 
 ```bash
-sudo docker compose up -d --build
+sudo docker-compose up -d --build
 ```
 
 第一次会很慢，可能 10–30 分钟，因为要安装 Python、Playwright 和 Chromium 浏览器。
@@ -93,7 +94,7 @@ sudo docker compose up -d --build
 查看是否启动成功：
 
 ```bash
-sudo docker compose ps
+sudo docker-compose ps
 ```
 
 如果看到 `Up` 或 `running`，说明服务启动了。
@@ -123,7 +124,7 @@ http://8.130.xxx.xxx
 ```bash
 cd /opt/xianyu-student-assistant
 git pull
-sudo docker compose up -d --build
+sudo docker-compose up -d --build
 ```
 
 ## 八、保存的数据在哪里
