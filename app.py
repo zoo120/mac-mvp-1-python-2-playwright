@@ -1,0 +1,711 @@
+"""Streamlit dashboard for the local Xianyu monitoring MVP."""
+
+from __future__ import annotations
+
+import sqlite3
+import subprocess
+import sys
+import socket
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+from typing import Any
+
+from database import (
+    DEFAULT_DB_PATH,
+    get_connection,
+    init_database,
+    list_saved_assets,
+    set_keyword_enabled,
+)
+
+
+PAGE_NAMES = ("学员选品助手", "今日概览", "关键词管理", "采集结果", "候选品", "素材保存")
+PROJECT_DIR = Path(__file__).resolve().parent
+DEFAULT_STUDENT_LIMIT = 10
+DEFAULT_PORT = 8501
+
+
+def _subprocess_error(completed: Any) -> str:
+    message = str(getattr(completed, "stderr", "") or getattr(completed, "stdout", "") or "")
+    return friendly_error_message(
+        message.strip() or f"子进程退出码：{getattr(completed, 'returncode', '未知')}"
+    )
+
+
+def get_local_lan_ip() -> str:
+    """Best-effort local LAN IP for same-Wi-Fi sharing."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return str(sock.getsockname()[0])
+    except OSError:
+        return "127.0.0.1"
+
+
+def build_lan_url(ip_address: str, port: int = DEFAULT_PORT) -> str:
+    value = str(ip_address or "").strip() or "127.0.0.1"
+    return f"http://{value}:{int(port)}"
+
+
+def parse_saved_folder_from_message(message: str) -> str:
+    """Extract the local saved folder path from asset_saver's success message."""
+    text = str(message or "").strip()
+    prefix = "已保存到："
+    if prefix not in text:
+        return ""
+    after_prefix = text.split(prefix, 1)[1]
+    return after_prefix.split("，图片", 1)[0].strip()
+
+
+def open_folder_for_streamlit(
+    folder_path: str,
+    *,
+    runner: Any = subprocess.run,
+) -> None:
+    """Open a saved folder in Finder on the local Mac."""
+    path = Path(str(folder_path or "")).expanduser()
+    if not path.exists() or not path.is_dir():
+        raise ValueError("素材文件夹不存在，请先重新保存一次。")
+    runner(["open", str(path)], check=True)
+
+
+def friendly_error_message(message: str) -> str:
+    """Convert common technical failures into learner-readable Chinese hints."""
+    text = str(message or "").strip()
+    if "ERR_TUNNEL_CONNECTION_FAILED" in text:
+        return (
+            "网络代理/VPN连接失败，程序打不开闲鱼。请先关闭 VPN/代理，"
+            "或者在系统设置里关闭代理后，再点一次搜索。"
+        )
+    if "ERR_PROXY_CONNECTION_FAILED" in text:
+        return "代理连接失败。请关闭代理/VPN 后，再点一次搜索。"
+    if "ERR_NAME_NOT_RESOLVED" in text or "ERR_INTERNET_DISCONNECTED" in text:
+        return "网络连接失败。请先确认 Mac 能正常打开网页，再点一次搜索。"
+    if "闲鱼要求登录或安全验证" in text or "需要登录" in text or "安全验证" in text:
+        return "闲鱼要求登录或安全验证。请在弹出的浏览器里完成登录/验证后，再点一次搜索。"
+    first_line = text.splitlines()[0] if text else "未知错误"
+    return first_line[:240]
+
+
+def run_student_keyword_search_for_streamlit(
+    keyword: str,
+    limit: int,
+    db_path: str | Path = DEFAULT_DB_PATH,
+    *,
+    runner: Any = subprocess.run,
+) -> tuple[int, int]:
+    """Run learner keyword crawl in a child process to avoid Streamlit event-loop conflicts."""
+    completed = runner(
+        [
+            sys.executable,
+            str(PROJECT_DIR / "crawler.py"),
+            "--student-keyword",
+            str(keyword),
+            "--limit",
+            str(limit),
+            "--db",
+            str(db_path),
+        ],
+        cwd=str(PROJECT_DIR),
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(_subprocess_error(completed))
+    current_rows = query_student_results(keyword, db_path)
+    return len(current_rows), len(current_rows)
+
+
+def save_product_assets_for_streamlit(
+    item_url: str,
+    title_hint: str,
+    db_path: str | Path = DEFAULT_DB_PATH,
+    *,
+    runner: Any = subprocess.run,
+) -> str:
+    """Save product assets in a child process to avoid Streamlit event-loop conflicts."""
+    completed = runner(
+        [
+            sys.executable,
+            str(PROJECT_DIR / "asset_saver.py"),
+            "--item-url",
+            str(item_url),
+            "--title-hint",
+            str(title_hint),
+            "--db",
+            str(db_path),
+        ],
+        cwd=str(PROJECT_DIR),
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(_subprocess_error(completed))
+    return str(completed.stdout or "").strip()
+
+
+def _placeholders(values: Sequence[Any]) -> str:
+    return ",".join("?" for _ in values)
+
+
+def get_dashboard_summary(
+    db_path: str | Path = DEFAULT_DB_PATH,
+) -> dict[str, int]:
+    with get_connection(db_path) as connection:
+        today_items = connection.execute(
+            "SELECT COUNT(*) FROM crawled_items WHERE crawl_date = date('now', 'localtime')"
+        ).fetchone()[0]
+        enabled_keywords = connection.execute(
+            "SELECT COUNT(*) FROM keywords WHERE enabled = 1"
+        ).fetchone()[0]
+        today_candidates = connection.execute(
+            """
+            SELECT COUNT(*) FROM product_candidates
+            WHERE date(created_at, 'localtime') = date('now', 'localtime')
+            """
+        ).fetchone()[0]
+    return {
+        "today_items": int(today_items),
+        "enabled_keywords": int(enabled_keywords),
+        "today_candidates": int(today_candidates),
+    }
+
+
+def query_crawled_items(
+    db_path: str | Path = DEFAULT_DB_PATH,
+    *,
+    keywords: Sequence[str] | None = None,
+    min_price: float | None = None,
+    max_price: float | None = None,
+    min_want_count: int | None = None,
+    limit: int = 1_000,
+) -> list[sqlite3.Row]:
+    conditions: list[str] = []
+    params: list[Any] = []
+    if keywords:
+        conditions.append(f"keyword IN ({_placeholders(keywords)})")
+        params.extend(keywords)
+    if min_price is not None:
+        conditions.append("price IS NOT NULL AND price >= ?")
+        params.append(min_price)
+    if max_price is not None:
+        conditions.append("price IS NOT NULL AND price <= ?")
+        params.append(max_price)
+    if min_want_count is not None:
+        conditions.append("want_count IS NOT NULL AND want_count >= ?")
+        params.append(min_want_count)
+
+    where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    params.append(max(1, int(limit)))
+    with get_connection(db_path) as connection:
+        return connection.execute(
+            f"""
+            SELECT id, keyword, title, price, want_count, location, seller_type,
+                   item_url, image_url, crawl_date, created_at
+            FROM crawled_items
+            {where_sql}
+            ORDER BY crawl_date DESC, created_at DESC, id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+
+
+def query_candidates(
+    db_path: str | Path = DEFAULT_DB_PATH,
+    *,
+    keywords: Sequence[str] | None = None,
+    statuses: Sequence[str] | None = None,
+    risk_levels: Sequence[str] | None = None,
+    limit: int = 1_000,
+) -> list[sqlite3.Row]:
+    conditions: list[str] = []
+    params: list[Any] = []
+    for column, values in (
+        ("keyword", keywords),
+        ("recommendation_status", statuses),
+        ("risk_level", risk_levels),
+    ):
+        if values:
+            conditions.append(f"{column} IN ({_placeholders(values)})")
+            params.extend(values)
+    where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    params.append(max(1, int(limit)))
+    with get_connection(db_path) as connection:
+        return connection.execute(
+            f"""
+            SELECT id, product_name, keyword, title, price, want_count, item_url,
+                   reason, risk_level, recommendation_status, created_at
+            FROM product_candidates
+            {where_sql}
+            ORDER BY
+                CASE recommendation_status
+                    WHEN '可交付候选' THEN 1
+                    WHEN '可观察' THEN 2
+                    ELSE 3
+                END,
+                created_at DESC,
+                id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+
+
+def query_material_candidates(
+    db_path: str | Path = DEFAULT_DB_PATH,
+    *,
+    limit: int = 200,
+) -> list[sqlite3.Row]:
+    """Return candidate products that have links and can be saved as materials."""
+    with get_connection(db_path) as connection:
+        return connection.execute(
+            """
+            SELECT id, product_name, keyword, title, price, want_count, item_url,
+                   reason, risk_level, recommendation_status, created_at
+            FROM product_candidates
+            WHERE item_url <> ''
+            ORDER BY
+                CASE recommendation_status
+                    WHEN '可交付候选' THEN 1
+                    WHEN '可观察' THEN 2
+                    ELSE 3
+                END,
+                CASE risk_level
+                    WHEN '低' THEN 1
+                    WHEN '中' THEN 2
+                    ELSE 3
+                END,
+                COALESCE(want_count, 0) DESC,
+                created_at DESC,
+                id DESC
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+
+
+def query_student_results(
+    keyword: str,
+    db_path: str | Path = DEFAULT_DB_PATH,
+    *,
+    limit: int = 50,
+) -> list[sqlite3.Row]:
+    """Return learner-facing hot links for one keyword, sorted by heat proxy."""
+    normalized_keyword = str(keyword or "").strip()
+    if not normalized_keyword:
+        return []
+    with get_connection(db_path) as connection:
+        return connection.execute(
+            """
+            SELECT id, keyword, title, price, want_count, location, seller_type,
+                   item_url, image_url, crawl_date, created_at
+            FROM crawled_items
+            WHERE keyword = ? AND item_url <> ''
+            ORDER BY
+                COALESCE(want_count, -1) DESC,
+                COALESCE(price, 0) DESC,
+                created_at DESC,
+                id DESC
+            LIMIT ?
+            """,
+            (normalized_keyword, max(1, int(limit))),
+        ).fetchall()
+
+
+def is_student_result_for_keyword(row: Mapping[str, Any], keyword: str) -> bool:
+    return str(row.get("keyword") or "").strip() == str(keyword or "").strip()
+
+
+def _rows_to_dataframe(rows: Sequence[sqlite3.Row], pandas_module: Any) -> Any:
+    return pandas_module.DataFrame([dict(row) for row in rows])
+
+
+def _keyword_options(db_path: str | Path = DEFAULT_DB_PATH) -> list[str]:
+    with get_connection(db_path) as connection:
+        return [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT keyword FROM keywords ORDER BY priority DESC, id ASC"
+            ).fetchall()
+        ]
+
+
+def _render_overview(st: Any, pd: Any) -> None:
+    st.header("今日概览")
+    summary = get_dashboard_summary()
+    columns = st.columns(3)
+    columns[0].metric("今日采集数量", summary["today_items"])
+    columns[1].metric("启用关键词", summary["enabled_keywords"])
+    columns[2].metric("今日候选品", summary["today_candidates"])
+
+    st.subheader("最近采集")
+    recent = _rows_to_dataframe(query_crawled_items(limit=10), pd)
+    if recent.empty:
+        st.info("还没有采集数据。先在终端运行 `python crawler.py --keyword 遮阳棚 --limit 3`。")
+        return
+    st.dataframe(
+        recent,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "item_url": st.column_config.LinkColumn("商品链接", display_text="打开商品"),
+            "image_url": st.column_config.ImageColumn("图片"),
+        },
+    )
+
+
+def _save_one_product_from_row(
+    st: Any,
+    row: Mapping[str, Any],
+    button_key: str,
+    *,
+    expected_keyword: str | None = None,
+) -> None:
+    if st.button("保存文案和图片", key=button_key):
+        if expected_keyword and not is_student_result_for_keyword(row, expected_keyword):
+            st.error(
+                f"这条不是“{expected_keyword}”的结果，已拦截保存。"
+                "请重新点击“开始搜索热度链接”。"
+            )
+            return
+        try:
+            with st.spinner("正在保存素材，弹出的浏览器不要关闭……"):
+                message = save_product_assets_for_streamlit(
+                    str(row["item_url"]),
+                    str(row["title"]),
+                )
+            st.success(message or "已保存文案和图片。")
+            folder_path = parse_saved_folder_from_message(message)
+            if folder_path:
+                st.session_state["last_saved_folder"] = folder_path
+                st.code(folder_path)
+        except Exception as exc:
+            st.error(f"保存失败：{exc}")
+            st.info("如果弹出浏览器要求登录或验证，请先手动完成，再点一次保存。")
+
+
+def _render_student_assistant(st: Any, pd: Any) -> None:
+    st.header("闲鱼选品助手")
+    st.caption("输入商品词，点搜索，看到热度商品后保存文案和图片。")
+
+    with st.expander("给学员怎么用？点这里看", expanded=False):
+        lan_url = build_lan_url(get_local_lan_ip())
+        st.write("如果学员和你在同一个 Wi‑Fi，可以让学员打开这个地址：")
+        st.code(lan_url)
+        st.write("如果学员不在同一个 Wi‑Fi，这个地址打不开，需要后续部署成真正线上版。")
+
+    columns = st.columns([3, 1])
+    keyword = columns[0].text_input(
+        "第 1 步：输入你想找的商品",
+        value=st.session_state.get("student_keyword", ""),
+        placeholder="例如：床垫、折叠桌、宠物烘干箱",
+    ).strip()
+    with columns[1]:
+        st.write("")
+        st.write("")
+        limit = DEFAULT_STUDENT_LIMIT
+
+    st.info("操作顺序：① 输入商品词 → ② 点搜索 → ③ 看结果 → ④ 点保存文案和图片")
+
+    if st.button("第 2 步：开始搜索", type="primary", width="stretch"):
+        if not keyword:
+            st.warning("请先输入商品词，比如：床垫")
+        else:
+            st.session_state["student_keyword"] = keyword
+            st.session_state["student_last_success_keyword"] = ""
+            try:
+                with st.spinner("正在打开闲鱼搜索并采集前几条结果，请稍等……"):
+                    item_count, candidate_count = run_student_keyword_search_for_streamlit(keyword, limit)
+                st.session_state["student_last_success_keyword"] = keyword
+                st.success(f"搜索完成：找到 {item_count} 条结果。")
+            except Exception as exc:
+                st.error(f"搜索失败：{exc}")
+                st.info("如果浏览器要求登录或验证，请完成后再点一次搜索。")
+                return
+
+    if not keyword:
+        st.info("输入关键词后点击搜索。")
+        return
+
+    last_success_keyword = st.session_state.get("student_last_success_keyword")
+    if last_success_keyword and last_success_keyword != keyword:
+        st.warning(
+            f"当前输入是“{keyword}”，但最近成功搜索的是“{last_success_keyword}”。"
+            "请重新点击“开始搜索热度链接”。"
+        )
+        return
+
+    rows = [dict(row) for row in query_student_results(keyword)]
+    if not rows:
+        st.info("还没有这个商品的数据。点击上面的“第 2 步：开始搜索”。")
+        return
+
+    st.subheader(f"第 3 步：查看“{keyword}”的热度结果")
+    st.caption("说明：闲鱼通常不直接展示真实销量，这里用“想要数”作为热度参考。")
+
+    for index, row in enumerate(rows[:DEFAULT_STUDENT_LIMIT], start=1):
+        with st.container(border=True):
+            cols = st.columns([1, 5, 2, 2])
+            cols[0].metric("排名", index)
+            cols[1].write(row["title"])
+            cols[1].caption(f"结果关键词：{row['keyword']}")
+            cols[2].metric("想要数", row["want_count"] if row["want_count"] is not None else "空")
+            price_text = f"¥{row['price']:.2f}" if row["price"] is not None else "空"
+            cols[3].metric("价格", price_text)
+            st.link_button("打开商品链接", row["item_url"])
+            _save_one_product_from_row(
+                st,
+                row,
+                f"student_save_{row['id']}",
+                expected_keyword=keyword,
+            )
+
+    last_saved_folder = st.session_state.get("last_saved_folder")
+    if last_saved_folder:
+        st.divider()
+        st.subheader("第 4 步：打开刚保存的素材")
+        st.write("刚保存的素材文件夹：")
+        st.code(str(last_saved_folder))
+        if st.button("在访达打开素材文件夹", type="primary"):
+            try:
+                open_folder_for_streamlit(str(last_saved_folder))
+                st.success("已打开访达。里面的“文案.txt”是文案，“images”是图片。")
+            except Exception as exc:
+                st.error(f"打开失败：{exc}")
+
+
+def _render_keywords(st: Any, pd: Any) -> None:
+    st.header("关键词管理")
+    st.caption("第一版支持启用或停用；优先级和备注可直接在 SQLite 中调整。")
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, keyword, category, enabled, priority, note, updated_at
+            FROM keywords ORDER BY priority DESC, id ASC
+            """
+        ).fetchall()
+    original = _rows_to_dataframe(rows, pd)
+    original["enabled"] = original["enabled"].astype(bool)
+    edited = st.data_editor(
+        original,
+        width="stretch",
+        hide_index=True,
+        disabled=["id", "keyword", "category", "priority", "note", "updated_at"],
+        column_config={
+            "id": None,
+            "keyword": "关键词",
+            "category": "分类",
+            "enabled": st.column_config.CheckboxColumn("启用"),
+            "priority": "优先级",
+            "note": "备注",
+            "updated_at": "更新时间",
+        },
+        key="keyword_editor",
+    )
+    if st.button("保存启停设置", type="primary"):
+        changed = 0
+        original_state = dict(zip(original["id"], original["enabled"], strict=True))
+        for row in edited.to_dict("records"):
+            keyword_id = int(row["id"])
+            enabled = bool(row["enabled"])
+            if enabled != bool(original_state[keyword_id]):
+                set_keyword_enabled(keyword_id, enabled)
+                changed += 1
+        if changed:
+            st.success(f"已保存 {changed} 个关键词的启停状态。")
+            st.rerun()
+        else:
+            st.info("没有需要保存的变化。")
+
+
+def _render_results(st: Any, pd: Any) -> None:
+    st.header("采集结果")
+    keyword_options = _keyword_options()
+    selected_keywords = st.multiselect("关键词", keyword_options)
+
+    price_enabled = st.checkbox("启用价格筛选")
+    min_price: float | None = None
+    max_price: float | None = None
+    if price_enabled:
+        price_columns = st.columns(2)
+        min_price = float(
+            price_columns[0].number_input("最低价格", min_value=0.0, value=0.0, step=10.0)
+        )
+        max_price = float(
+            price_columns[1].number_input(
+                "最高价格", min_value=0.0, value=10_000.0, step=100.0
+            )
+        )
+
+    wants_enabled = st.checkbox("启用最低想要数筛选")
+    min_wants = (
+        int(st.number_input("最低想要数", min_value=0, value=0, step=1))
+        if wants_enabled
+        else None
+    )
+    rows = query_crawled_items(
+        keywords=selected_keywords,
+        min_price=min_price,
+        max_price=max_price,
+        min_want_count=min_wants,
+    )
+    data = _rows_to_dataframe(rows, pd)
+    st.caption(f"共 {len(data)} 条（最多显示 1000 条）")
+    if data.empty:
+        st.info("当前筛选条件下没有数据。")
+        return
+    st.dataframe(
+        data,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "item_url": st.column_config.LinkColumn("商品链接", display_text="打开商品"),
+            "image_url": st.column_config.ImageColumn("图片"),
+            "price": st.column_config.NumberColumn("价格", format="¥ %.2f"),
+            "want_count": st.column_config.NumberColumn("想要数", format="%d"),
+        },
+    )
+
+
+def _render_candidates(st: Any, pd: Any) -> None:
+    st.header("候选品")
+    st.caption("表格文字可选中后按 ⌘C 复制；商品链接可直接点击。")
+    filter_columns = st.columns(3)
+    selected_keywords = filter_columns[0].multiselect("关键词", _keyword_options())
+    selected_statuses = filter_columns[1].multiselect(
+        "推荐状态", ["可交付候选", "可观察", "不建议"]
+    )
+    selected_risks = filter_columns[2].multiselect("风险等级", ["低", "中", "高"])
+    rows = query_candidates(
+        keywords=selected_keywords,
+        statuses=selected_statuses,
+        risk_levels=selected_risks,
+    )
+    data = _rows_to_dataframe(rows, pd)
+    st.caption(f"共 {len(data)} 条（最多显示 1000 条）")
+    if data.empty:
+        st.info("当前筛选条件下没有候选品。")
+        return
+    st.dataframe(
+        data,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "item_url": st.column_config.LinkColumn("商品链接", display_text="打开商品"),
+            "price": st.column_config.NumberColumn("价格", format="¥ %.2f"),
+            "want_count": st.column_config.NumberColumn("想要数", format="%d"),
+        },
+    )
+
+
+def _format_material_choice(row: Mapping[str, Any]) -> str:
+    price = row["price"]
+    wants = row["want_count"]
+    price_text = f"¥{price:.0f}" if price is not None else "价格空"
+    wants_text = f"{wants}想要" if wants is not None else "想要数空"
+    return (
+        f"{row['recommendation_status']}｜{row['keyword']}｜"
+        f"{price_text}｜{wants_text}｜{row['title']}"
+    )
+
+
+def _render_asset_saver(st: Any, pd: Any) -> None:
+    st.header("素材保存")
+    st.caption("从候选品里选一条，打开详情页后自动保存商品文案和图片到本地。")
+
+    candidates = [dict(row) for row in query_material_candidates()]
+    if not candidates:
+        st.info("还没有可保存素材的候选品。先采集并生成候选品。")
+        return
+
+    candidate_by_id = {int(candidate["id"]): candidate for candidate in candidates}
+    selected_id = st.selectbox(
+        "选择要保存的商品",
+        list(candidate_by_id),
+        format_func=lambda candidate_id: _format_material_choice(
+            candidate_by_id[int(candidate_id)]
+        ),
+        index=0,
+    )
+    selected = candidate_by_id[int(selected_id)]
+    st.write("商品链接：", selected["item_url"])
+    st.write("列表标题：", selected["title"])
+
+    if st.button("一键保存文案和图片", type="primary"):
+        try:
+            from asset_saver import save_product_assets
+
+            with st.spinner("正在打开商品详情页并保存素材，浏览器弹出时不要关闭它……"):
+                result = save_product_assets(
+                    selected["item_url"],
+                    title_hint=selected["title"],
+                )
+            st.success(
+                f"已保存：{result['folder_path']}，图片 {result['image_count']} 张。"
+            )
+            st.code(str(result["folder_path"]))
+        except Exception as exc:
+            st.error(f"保存失败：{exc}")
+            st.info("如果页面要求登录或验证，请在弹出的浏览器里完成后，再点一次保存。")
+
+    st.subheader("已保存素材")
+    saved = _rows_to_dataframe(list_saved_assets(), pd)
+    if saved.empty:
+        st.info("还没有保存过素材。")
+        return
+    st.dataframe(
+        saved,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "item_url": st.column_config.LinkColumn("商品链接", display_text="打开商品"),
+            "image_count": st.column_config.NumberColumn("图片数", format="%d"),
+        },
+    )
+
+
+def main() -> None:
+    try:
+        import pandas as pd
+        import streamlit as st
+    except ImportError as exc:
+        raise RuntimeError(
+            "后台依赖尚未安装，请先运行 pip install -r requirements.txt"
+        ) from exc
+
+    st.set_page_config(page_title="闲鱼选品助手", page_icon="📦", layout="wide")
+    init_database()
+    st.title("闲鱼选品助手")
+    admin_mode = st.sidebar.toggle("显示管理员功能", value=False)
+    st.sidebar.caption("默认给学员使用；管理员功能请打开上方开关。")
+    st.sidebar.write("本机打开：")
+    st.sidebar.code(build_lan_url("localhost"))
+    st.sidebar.write("同 Wi‑Fi 学员打开：")
+    st.sidebar.code(build_lan_url(get_local_lan_ip()))
+
+    if not admin_mode:
+        _render_student_assistant(st, pd)
+        return
+
+    page = st.sidebar.radio("管理员页面", PAGE_NAMES)
+    st.sidebar.caption("管理员功能 · 本地 SQLite · 顺序低频采集")
+
+    if page == "学员选品助手":
+        _render_student_assistant(st, pd)
+    elif page == "今日概览":
+        _render_overview(st, pd)
+    elif page == "关键词管理":
+        _render_keywords(st, pd)
+    elif page == "采集结果":
+        _render_results(st, pd)
+    elif page == "候选品":
+        _render_candidates(st, pd)
+    else:
+        _render_asset_saver(st, pd)
+
+
+if __name__ == "__main__":
+    main()

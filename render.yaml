@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: xianyu-student-assistant
+    runtime: docker
+    plan: starter
+    autoDeploy: false
+    envVars:
+      - key: XIANYU_DB_PATH
+        value: /data/xianyu_monitor.db
+      - key: XIANYU_SAVED_PRODUCTS_DIR
+        value: /data/saved_products
+      - key: XIANYU_PROFILE_DIR
+        value: /data/playwright-profile
+      - key: XIANYU_LOG_DIR
+        value: /data/logs
+      - key: XIANYU_HEADLESS
+        value: "1"
+      - key: XIANYU_NO_SANDBOX
+        value: "1"
+    disk:
+      name: xianyu-data
+      mountPath: /data
+      sizeGB: 10
+    healthCheckPath: /

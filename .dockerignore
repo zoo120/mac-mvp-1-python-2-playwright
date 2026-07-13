@@ -1,0 +1,11 @@
+.DS_Store
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.playwright-profile
+logs
+saved_products
+xianyu_monitor.db
+outputs
+work
