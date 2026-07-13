@@ -1,0 +1,17 @@
+services:
+  xianyu-student-assistant:
+    build: .
+    image: xianyu-student-assistant:latest
+    container_name: xianyu-student-assistant
+    restart: unless-stopped
+    ports:
+      - "80:8501"
+    environment:
+      XIANYU_DB_PATH: /data/xianyu_monitor.db
+      XIANYU_SAVED_PRODUCTS_DIR: /data/saved_products
+      XIANYU_PROFILE_DIR: /data/playwright-profile
+      XIANYU_LOG_DIR: /data/logs
+      XIANYU_HEADLESS: "1"
+      XIANYU_NO_SANDBOX: "1"
+    volumes:
+      - ./server_data:/data

@@ -8,4 +8,7 @@ __pycache__/
 *.db-wal
 .playwright-profile/
 logs/
-
+saved_products/
+outputs/
+work/
+server_data/
