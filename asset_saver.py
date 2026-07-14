@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import sys
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from urllib.parse import urlparse
 
 from crawler import PROFILE_DIR, absolute_image_url
 from database import DEFAULT_DB_PATH, init_database, record_saved_asset
+from rules import FILTER_TERMS, WEIGHT_TERMS, evaluate_item
 from runtime_config import PROJECT_DIR, browser_args, browser_headless, env_path
 
 
@@ -172,6 +174,152 @@ def _unique_folder(root: Path, folder_name: str) -> Path:
     return root / f"{folder_name}_{timestamp}_{datetime.now().microsecond}"
 
 
+def _extract_price_from_text(text: str) -> float | None:
+    match = re.search(r"[¥￥]\s*([0-9]+(?:\.[0-9]+)?)", str(text or ""))
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def _extract_want_count_from_text(text: str) -> int | None:
+    match = re.search(r"([0-9]+(?:\.[0-9]+)?)(万)?\s*人?想要", str(text or ""))
+    if not match:
+        return None
+    number = float(match.group(1))
+    if match.group(2):
+        number *= 10_000
+    return int(number)
+
+
+def _matched_terms(text: str, terms: tuple[str, ...]) -> list[str]:
+    lowered = str(text or "").lower()
+    result: list[str] = []
+    for term in terms:
+        normalized = term.lower()
+        if normalized == "包":
+            if re.search(r"(女包|男包|包包|手提包|背包|挎包|包袋)", lowered):
+                result.append(term)
+            continue
+        if normalized in lowered:
+            result.append(term)
+    return result
+
+
+def _bullet_lines(values: list[str], fallback: str = "暂无明显提取项") -> str:
+    if not values:
+        return f"- {fallback}"
+    return "\n".join(f"- {value}" for value in values)
+
+
+def _extract_selling_points(title: str, description: str) -> list[str]:
+    text = _clean_text(f"{title} {description}")
+    parts = re.split(r"[。！？!?；;，,\n]+", text)
+    result: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        cleaned = _clean_text(part)
+        if len(cleaned) < 4 or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        result.append(cleaned[:80])
+        if len(result) >= 6:
+            break
+    return result
+
+
+def build_delivery_report(payload: dict[str, Any], image_count: int) -> str:
+    """Create a learner-facing product handoff report for the saved package."""
+    title = _clean_text(payload.get("title")) or "商品素材"
+    description = _clean_text(payload.get("description") or payload.get("raw_text"))
+    raw_text = _clean_text(payload.get("raw_text"))
+    combined_text = _clean_text(f"{title} {description} {raw_text}")
+    price = _extract_price_from_text(combined_text)
+    want_count = _extract_want_count_from_text(combined_text)
+    decision = evaluate_item(
+        {
+            "title": title,
+            "price": price,
+            "want_count": want_count,
+            "item_url": payload.get("item_url"),
+        }
+    )
+    weight_terms = _matched_terms(combined_text, WEIGHT_TERMS)
+    filter_terms = _matched_terms(combined_text, FILTER_TERMS)
+    selling_points = _extract_selling_points(title, description)
+
+    risk_notes: list[str] = []
+    if filter_terms:
+        risk_notes.append(f"命中过滤词：{'、'.join(filter_terms)}，不建议直接交付。")
+    if image_count <= 0:
+        risk_notes.append("没有成功保存图片，需要重新保存或人工补图。")
+    if want_count is None:
+        risk_notes.append("未识别到想要数，热度只能人工二次判断。")
+    if price is not None and price <= 30:
+        risk_notes.append("价格偏低，可能是配件、小百货或引流低价。")
+    if not risk_notes:
+        risk_notes.append("未发现明显硬伤，但仍需确认供货、物流、售后和同款价格。")
+
+    price_text = f"¥{price:g}" if price is not None else "未识别"
+    want_text = str(want_count) if want_count is not None else "未识别"
+    weighted_text = "、".join(weight_terms) if weight_terms else "未命中"
+    filtered_text = "、".join(filter_terms) if filter_terms else "未命中"
+
+    return f"""# 选品交付建议
+
+## 商品基础信息
+
+- 商品标题：{title}
+- 商品链接：{payload.get("item_url", "")}
+- 识别价格：{price_text}
+- 识别想要数：{want_text}
+- 已保存图片：{image_count} 张
+
+## 系统初步判断
+
+- 推荐状态：{decision.recommendation_status}
+- 风险等级：{decision.risk_level}
+- 判断原因：{decision.reason}
+- 加权词：{weighted_text}
+- 过滤词：{filtered_text}
+
+## 可用于上架的卖点
+
+{_bullet_lines(selling_points)}
+
+## 交付前必须检查
+
+- 闲鱼/淘宝/拼多多同款价格是否还有利润空间。
+- 商品是否能稳定发货，是否适合发物流或快递。
+- 大件商品要先确认运费、退换货责任、安装/尺寸问题。
+- 文案和图片可参考，不要原封不动照搬，避免重复和侵权风险。
+
+## 风险提醒
+
+{_bullet_lines(risk_notes)}
+
+## 素材包里有什么
+
+- `文案.txt`：从商品页提取的主要文案。
+- `images/`：保存到的商品图片。
+- `商品信息.json`：原始结构化信息，方便后续排查。
+- `选品交付建议.md`：本文件，可直接发给学员做判断参考。
+"""
+
+
+def create_material_zip(folder: Path) -> Path:
+    """Zip the saved product folder so learners can download one file."""
+    zip_path = folder / "素材包.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(folder.rglob("*")):
+            if path == zip_path or path.is_dir():
+                continue
+            archive.write(path, path.relative_to(folder))
+    return zip_path
+
+
 def save_material_files(
     payload: dict[str, Any],
     image_files: list[tuple[str, bytes, str]],
@@ -198,10 +346,19 @@ def save_material_files(
         image_path.write_bytes(content)
         saved_images.append(str(image_path))
 
+    report_path = folder / "选品交付建议.md"
+    report_path.write_text(
+        build_delivery_report(payload, len(saved_images)),
+        encoding="utf-8",
+    )
+    zip_path = create_material_zip(folder)
+
     return {
         "folder_path": folder,
         "copy_path": folder / "文案.txt",
         "metadata_path": folder / "商品信息.json",
+        "report_path": report_path,
+        "zip_path": zip_path,
         "image_count": len(saved_images),
         "image_paths": saved_images,
     }
@@ -369,7 +526,10 @@ def main() -> int:
             db_path=args.db,
             output_root=args.output_root,
         )
-        print(f"已保存到：{result['folder_path']}，图片 {result['image_count']} 张。")
+        print(
+            f"已保存到：{result['folder_path']}，图片 {result['image_count']} 张，"
+            f"素材包：{result['zip_path']}。"
+        )
     except KeyboardInterrupt:
         print("\n已由用户停止保存。")
         return 130

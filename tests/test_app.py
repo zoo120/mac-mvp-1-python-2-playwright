@@ -8,7 +8,9 @@ from app import (
     is_student_result_for_keyword,
     open_folder_for_streamlit,
     parse_saved_folder_from_message,
+    parse_saved_zip_from_message,
     query_student_results,
+    recommend_seed_products,
     run_student_keyword_search_for_streamlit,
     save_product_assets_for_streamlit,
     query_material_candidates,
@@ -215,6 +217,16 @@ def test_student_result_keyword_guard_prevents_wrong_product_save():
     assert not is_student_result_for_keyword({"keyword": "狗笼"}, "床垫")
 
 
+def test_seed_product_recommendations_are_targeted_by_scene():
+    pet_recommendations = recommend_seed_products("宠物", limit=3)
+    assert pet_recommendations
+    assert any("宠物" in item["reason"] or "狗" in item["keyword"] for item in pet_recommendations)
+
+    stall_recommendations = recommend_seed_products("摆摊", limit=3)
+    assert stall_recommendations
+    assert any("摆摊" in item["reason"] or "小吃车" in item["keyword"] for item in stall_recommendations)
+
+
 def test_student_search_uses_child_process_not_inline_event_loop(tmp_path):
     db_path = tmp_path / "test.db"
     init_database(db_path)
@@ -289,6 +301,16 @@ def test_saved_folder_path_can_be_parsed_from_success_message():
         == "/tmp/demo folder"
     )
     assert parse_saved_folder_from_message("保存失败") == ""
+
+
+def test_saved_zip_path_can_be_parsed_from_success_message():
+    assert (
+        parse_saved_zip_from_message(
+            "已保存到：/tmp/demo，图片 5 张，素材包：/tmp/demo/素材包.zip。"
+        )
+        == "/tmp/demo/素材包.zip"
+    )
+    assert parse_saved_zip_from_message("已保存到：/tmp/demo，图片 5 张。") == ""
 
 
 def test_open_folder_uses_finder_command(tmp_path):

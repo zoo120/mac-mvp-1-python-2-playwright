@@ -1,4 +1,5 @@
 import json
+import zipfile
 
 import pytest
 
@@ -68,6 +69,38 @@ def test_save_material_files_writes_copy_json_and_images(tmp_path):
     assert saved_json["item_url"] == "https://www.goofish.com/item?id=200"
     assert (folder / "images" / "图片1.jpg").read_bytes() == b"fake-image-bytes"
     assert result["image_count"] == 1
+
+
+def test_save_material_files_creates_delivery_report_and_zip_package(tmp_path):
+    payload = {
+        "title": "商用加厚折叠床垫 可发物流",
+        "description": "宿舍出租房都能用，加厚舒适，支持发物流。",
+        "item_url": "https://www.goofish.com/item?id=201",
+        "images": ["https://img.example/a.jpg"],
+        "raw_text": "¥ 268 88人想要 商用加厚折叠床垫 可发物流",
+    }
+
+    result = save_material_files(
+        payload,
+        [("https://img.example/a.jpg", b"fake-image-bytes", "jpg")],
+        tmp_path,
+    )
+
+    report_path = result["report_path"]
+    zip_path = result["zip_path"]
+    assert report_path.exists()
+    report = report_path.read_text(encoding="utf-8")
+    assert "选品交付建议" in report
+    assert "商用加厚折叠床垫" in report
+    assert "可交付候选" in report
+
+    assert zip_path.exists()
+    with zipfile.ZipFile(zip_path) as archive:
+        names = set(archive.namelist())
+    assert "文案.txt" in names
+    assert "商品信息.json" in names
+    assert "选品交付建议.md" in names
+    assert "images/图片1.jpg" in names
 
 
 @pytest.mark.parametrize(
