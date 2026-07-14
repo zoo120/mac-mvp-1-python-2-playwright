@@ -420,6 +420,12 @@ async def crawl_keyword(
 
     locator = await _find_card_locator(page)
     if locator is None:
+        page_text = await _body_text(page)
+        if needs_manual_intervention(page_text):
+            raise RuntimeError(
+                "闲鱼要求登录或安全验证。管理员请先在后台“云端登录”页面扫码/验证；"
+                "如果仍然受限，请让学员用商品链接直接保存素材。"
+            )
         LOGGER.warning("关键词“%s”未找到商品卡片，页面结构可能已变化。", keyword)
         return []
 
@@ -445,6 +451,13 @@ async def crawl_keyword(
             LOGGER.exception("关键词“%s”第 %s 个商品解析失败：%s", keyword, index + 1, exc)
 
     LOGGER.info("关键词“%s”解析到 %s 条商品。", keyword, len(results))
+    if not results:
+        page_text = await _body_text(page)
+        if needs_manual_intervention(page_text):
+            raise RuntimeError(
+                "闲鱼要求登录或安全验证。管理员请先在后台“云端登录”页面扫码/验证；"
+                "如果仍然受限，请让学员用商品链接直接保存素材。"
+            )
     return results
 
 

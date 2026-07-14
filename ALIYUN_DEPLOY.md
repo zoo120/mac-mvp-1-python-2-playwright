@@ -1,164 +1,104 @@
-# 阿里云 ECS 部署说明（小白版）
+# 阿里云线上版说明（当前最终方案）
 
-这份文档用于把“闲鱼选品助手”放到阿里云服务器上。部署成功后，学员可以通过一个公网 IP 或域名访问。
+这版不是“同 Wi‑Fi 本地测试”，而是放在阿里云 ECS 上运行。你的 Mac 关机、没电，不影响学员打开网站。
 
-## 一、购买阿里云 ECS
+## 给学员的地址
 
-建议配置：
-
-- 产品：ECS 云服务器
-- 地域：华东 2（上海）或华南 1（深圳）
-- 系统：Ubuntu 22.04 64 位
-- 规格：至少 2 核 4G
-- 系统盘：40G 或以上
-- 带宽：3M 起步，学员多建议 5M+
-- 安全组：至少开放 `22` 和 `80` 端口
-
-不要买太低配置。这个工具要运行 Python、Streamlit 和 Playwright 浏览器，1 核 1G 很容易失败。
-
-## 二、连接服务器
-
-进入阿里云控制台：
-
-1. 打开 ECS 实例列表。
-2. 找到刚买的服务器。
-3. 点“远程连接”。
-4. 选择 Workbench。
-5. 登录系统终端。
-
-看到黑色命令行窗口后，继续下一步。
-
-## 三、安装 Docker
-
-在服务器终端复制执行：
-
-```bash
-sudo apt-get update
-sudo apt-get install -y ca-certificates curl git docker.io docker-compose
-sudo systemctl enable docker
-sudo systemctl start docker
-sudo docker --version
-docker-compose --version
-```
-
-如果最后能看到 Docker 版本号，说明安装成功。
-
-## 四、下载项目代码
-
-进入 `/opt` 目录：
-
-```bash
-cd /opt
-```
-
-如果 GitHub 仓库是公开的，执行：
-
-```bash
-sudo git clone https://github.com/zoo120/mac-mvp-1-python-2-playwright.git xianyu-student-assistant
-```
-
-如果 GitHub 仓库是私有的，执行：
-
-```bash
-sudo git clone https://github.com/zoo120/mac-mvp-1-python-2-playwright.git xianyu-student-assistant
-```
-
-它会问：
+发给学员的是：
 
 ```text
-Username:
-Password:
+http://你的阿里云公网IP
 ```
 
-Username 填你的 GitHub 用户名。  
-Password 不要填 GitHub 登录密码，要填 GitHub Personal Access Token。
-
-如果你不知道 Token 是什么，先把仓库保持私有，告诉我当前页面，我再一步步带你创建 Token。
-
-## 五、启动网站
-
-进入项目目录：
-
-```bash
-cd /opt/xianyu-student-assistant
-```
-
-启动：
-
-```bash
-sudo docker-compose up -d --build
-```
-
-第一次会很慢，可能 10–30 分钟，因为要安装 Python、Playwright 和 Chromium 浏览器。
-
-查看是否启动成功：
-
-```bash
-sudo docker-compose ps
-```
-
-如果看到 `Up` 或 `running`，说明服务启动了。
-
-## 六、打开网站
-
-在阿里云 ECS 实例页面找到“公网 IP”。
-
-浏览器访问：
+不要发：
 
 ```text
-http://你的公网IP
+http://localhost:8501
+http://172.开头的地址
 ```
 
-例如：
+`localhost` 和 `172.*` 都不是全国学员可用地址。
 
-```text
-http://8.130.xxx.xxx
-```
+## 当前推荐用法
 
-能打开“闲鱼热卖品监测 MVP / 学员选品助手”页面，就成功了。
+因为闲鱼会限制云服务器自动搜索，所以给学员的稳定流程是：
 
-## 七、以后更新代码
+1. 学员自己在闲鱼 App 或网页里搜索商品。
+2. 复制某个商品链接。
+3. 回到“闲鱼选品助手”网页。
+4. 粘贴商品链接。
+5. 点击“保存这个链接的文案和图片”。
 
-进入服务器：
+自动搜索仍保留，但它是试用功能：如果闲鱼要求登录、验证或风控，可能返回 0。
+
+## 管理员要做的事
+
+如果自动搜索一直是 0：
+
+1. 打开网站。
+2. 左侧打开“显示管理员功能”。
+3. 进入“云端登录”。
+4. 点击“启动 3 分钟扫码/验证窗口”。
+5. 等 5–10 秒，点“刷新二维码截图”。
+6. 如果截图里出现二维码或验证页，用手机扫码/验证。
+7. 点“登录后测试搜索”。
+
+这一步是在阿里云服务器上保存闲鱼浏览器状态，不要求你的 Mac 一直开着。
+
+## 阿里云服务器更新命令
+
+如果服务器目录本身是 Git 仓库，进入阿里云黑色终端执行：
 
 ```bash
-cd /opt/xianyu-student-assistant
-git pull
-sudo docker-compose up -d --build
+cd /opt/xianyu-student-assistant && bash deploy/aliyun_systemd_update.sh
 ```
 
-## 八、保存的数据在哪里
+如果你不确定是不是 Git 仓库，直接用下面这个更稳的更新命令：
 
-服务器上的数据库、图片、文案会保存在：
+```bash
+cd /opt && apt-get update && apt-get install -y unzip wget && rm -rf xianyu-student-assistant_new main.zip && wget -O main.zip https://github.com/zoo120/mac-mvp-1-python-2-playwright/archive/refs/heads/main.zip && unzip -q main.zip && mv mac-mvp-1-python-2-playwright-main xianyu-student-assistant_new && systemctl stop xianyu-student-assistant || true && rm -rf xianyu-student-assistant_old && mv xianyu-student-assistant xianyu-student-assistant_old || true && mv xianyu-student-assistant_new xianyu-student-assistant && cp -a xianyu-student-assistant_old/.venv xianyu-student-assistant/.venv 2>/dev/null || true && cd xianyu-student-assistant && bash deploy/aliyun_systemd_update.sh
+```
+
+这条命令不会删除 `/opt/xianyu-data`，所以数据库、素材、云端登录状态会保留。
+
+如果只想看服务是否正常：
+
+```bash
+systemctl status xianyu-student-assistant --no-pager
+```
+
+看到：
 
 ```text
-/opt/xianyu-student-assistant/server_data
+Active: active (running)
 ```
 
-里面会有：
+就是网站正在运行。
 
-- `xianyu_monitor.db`
-- `saved_products/`
-- `playwright-profile/`
-- `logs/`
+## 数据保存在哪里
 
-这个目录不要删除。
+服务器数据保存在：
 
-## 九、重要提醒
+```text
+/opt/xianyu-data
+```
 
-线上服务器没有你本地 Mac 那种可见浏览器窗口。闲鱼如果要求登录、验证码或安全验证，线上采集可能会失败。
+主要目录：
 
-第一版线上 MVP 适合先验证流程：
+- `/opt/xianyu-data/xianyu_monitor.db`：数据库
+- `/opt/xianyu-data/saved_products`：保存的文案和图片
+- `/opt/xianyu-data/playwright-profile`：云端闲鱼登录状态
+- `/opt/xianyu-data/logs`：运行截图和日志
 
-1. 学员打开网页。
-2. 输入商品词。
-3. 搜索热度链接。
-4. 一键保存文案和图片。
+不要删除 `/opt/xianyu-data`。
 
-如果要稳定给大量学员使用，后续建议升级：
+## 重要说明
 
-- 后台账号登录管理；
-- 任务队列，避免多人同时采集；
-- 学员账号隔离；
-- 图片云存储；
-- 域名和 HTTPS。
+阿里云服务器是能用的，钱没有白花。它负责让全国学员访问网页。
+
+但闲鱼搜索本身会识别云服务器、无头浏览器、异常访问，所以“自动搜索热度链接”不可能保证每次都稳定。最终版已经做了两条路：
+
+- 能搜出来：直接看热度结果并保存素材。
+- 搜不出来：学员粘贴商品链接，一键保存文案和图片。
+
+这才是现在能稳定交付给学员的方案。

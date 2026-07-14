@@ -25,9 +25,10 @@ class CompletedProcessStub:
         self.stderr = stderr
 
 
-def test_app_exposes_four_required_pages():
+def test_app_exposes_required_pages():
     assert PAGE_NAMES == (
         "学员选品助手",
+        "云端登录",
         "今日概览",
         "关键词管理",
         "采集结果",

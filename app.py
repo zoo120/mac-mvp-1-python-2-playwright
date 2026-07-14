@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import os
+import socket
 import sqlite3
 import subprocess
 import sys
-import socket
-import os
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -20,10 +21,19 @@ from database import (
 )
 
 
-PAGE_NAMES = ("学员选品助手", "今日概览", "关键词管理", "采集结果", "候选品", "素材保存")
+PAGE_NAMES = (
+    "学员选品助手",
+    "云端登录",
+    "今日概览",
+    "关键词管理",
+    "采集结果",
+    "候选品",
+    "素材保存",
+)
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_STUDENT_LIMIT = 10
 DEFAULT_PORT = 8501
+DEFAULT_CLOUD_LOGIN_SECONDS = 180
 
 
 def _subprocess_error(completed: Any) -> str:
@@ -60,6 +70,71 @@ def is_online_deployment() -> bool:
             "XIANYU_HEADLESS",
         )
     )
+
+
+def cloud_login_screenshot_path() -> Path:
+    """Screenshot path used by the server-side Xianyu login helper."""
+    explicit = os.getenv("XIANYU_LOGIN_SCREENSHOT")
+    if explicit:
+        return Path(explicit).expanduser()
+    base = Path(os.getenv("XIANYU_LOG_DIR") or (PROJECT_DIR / "logs")).expanduser()
+    return base / "xianyu_login.png"
+
+
+def cloud_login_pid_path() -> Path:
+    return cloud_login_screenshot_path().with_suffix(".pid")
+
+
+def is_pid_running(pid: int) -> bool:
+    """Best-effort process check that works on Linux/macOS."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def cloud_login_process_status() -> str:
+    pid_file = cloud_login_pid_path()
+    if not pid_file.exists():
+        return "未启动"
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return "状态未知"
+    return f"运行中（PID {pid}）" if is_pid_running(pid) else "已结束，可重新启动"
+
+
+def start_cloud_login_session(
+    *,
+    wait_seconds: int = DEFAULT_CLOUD_LOGIN_SECONDS,
+    keyword: str = "床垫",
+) -> int:
+    """Start a background server browser session for Xianyu login/verification."""
+    screenshot_path = cloud_login_screenshot_path()
+    screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path = cloud_login_pid_path()
+
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(PROJECT_DIR / "cloud_login.py"),
+            "--screenshot",
+            str(screenshot_path),
+            "--wait",
+            str(max(30, int(wait_seconds))),
+            "--keyword",
+            str(keyword or "床垫"),
+        ],
+        cwd=str(PROJECT_DIR),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    pid_path.write_text(str(process.pid), encoding="utf-8")
+    return int(process.pid)
 
 
 def render_student_usage_help(st: Any) -> None:
@@ -115,6 +190,8 @@ def friendly_error_message(message: str) -> str:
     if "ERR_NAME_NOT_RESOLVED" in text or "ERR_INTERNET_DISCONNECTED" in text:
         return "网络连接失败。请先确认 Mac 能正常打开网页，再点一次搜索。"
     if "闲鱼要求登录或安全验证" in text or "需要登录" in text or "安全验证" in text:
+        if is_online_deployment():
+            return "闲鱼要求登录或安全验证。管理员请打开左侧“云端登录”，先扫码/验证一次。"
         return "闲鱼要求登录或安全验证。请在弹出的浏览器里完成登录/验证后，再点一次搜索。"
     first_line = text.splitlines()[0] if text else "未知错误"
     return first_line[:240]
@@ -420,10 +497,15 @@ def _save_one_product_from_row(
             st.info("如果弹出浏览器要求登录或验证，请先手动完成，再点一次保存。")
 
 
-def _render_manual_asset_saver(st: Any, *, title_hint: str = "") -> None:
-    """Fallback learner flow when server-side Xianyu search is blocked."""
-    with st.expander("搜不到结果？可以粘贴商品链接直接保存素材", expanded=False):
-        st.write("如果搜索一直是 0，先让学员在闲鱼里自己找到商品，然后把商品链接粘贴到这里。")
+def _render_manual_asset_saver(
+    st: Any,
+    *,
+    title_hint: str = "",
+    expanded: bool = True,
+) -> None:
+    """Stable learner flow: save assets from a pasted Xianyu item URL."""
+    with st.expander("方式 1：粘贴闲鱼商品链接，直接保存素材（推荐）", expanded=expanded):
+        st.write("这是最稳定的学员用法：在闲鱼里找到商品，复制链接，粘贴到这里，一键保存文案和图片。")
         item_url = st.text_input(
             "粘贴闲鱼商品链接",
             placeholder="例如：https://www.goofish.com/item?id=...",
@@ -457,99 +539,172 @@ def _render_manual_asset_saver(st: Any, *, title_hint: str = "") -> None:
 
 def _render_student_assistant(st: Any, pd: Any) -> None:
     st.header("闲鱼选品助手")
-    st.caption("输入商品词，点搜索，看到热度商品后保存文案和图片。")
+    st.caption("给学员的稳定流程：复制闲鱼商品链接 → 粘贴到这里 → 保存文案和图片。")
 
     with st.expander("给学员怎么用？点这里看", expanded=False):
         render_student_usage_help(st)
 
-    columns = st.columns([3, 1])
-    keyword = columns[0].text_input(
-        "第 1 步：输入你想找的商品",
-        value=st.session_state.get("student_keyword", ""),
-        placeholder="例如：床垫、折叠桌、宠物烘干箱",
-    ).strip()
-    with columns[1]:
-        st.write("")
-        st.write("")
-        limit = DEFAULT_STUDENT_LIMIT
+    st.info("推荐顺序：① 学员在闲鱼找商品 → ② 复制商品链接 → ③ 粘贴到这里 → ④ 保存文案和图片")
+    _render_manual_asset_saver(st, expanded=True)
 
-    st.info("操作顺序：① 输入商品词 → ② 点搜索 → ③ 看结果 → ④ 点保存文案和图片")
+    st.divider()
+    with st.expander("方式 2：自动搜索热度链接（试用，可能被闲鱼限制）", expanded=False):
+        st.warning("自动搜索在云服务器上容易被闲鱼要求登录/验证。如果结果是 0，请直接用上面的方式 1。")
+        columns = st.columns([3, 1])
+        keyword = columns[0].text_input(
+            "输入你想找的商品",
+            value=st.session_state.get("student_keyword", ""),
+            placeholder="例如：床垫、折叠桌、宠物烘干箱",
+        ).strip()
+        with columns[1]:
+            st.write("")
+            st.write("")
+            limit = DEFAULT_STUDENT_LIMIT
 
-    if st.button("第 2 步：开始搜索", type="primary", width="stretch"):
-        if not keyword:
-            st.warning("请先输入商品词，比如：床垫")
-        else:
-            st.session_state["student_keyword"] = keyword
-            st.session_state["student_last_success_keyword"] = ""
-            try:
-                with st.spinner("正在打开闲鱼搜索并采集前几条结果，请稍等……"):
-                    item_count, candidate_count = run_student_keyword_search_for_streamlit(keyword, limit)
-                if item_count <= 0:
-                    st.session_state["student_last_success_keyword"] = keyword
-                    st.warning(
-                        "没有抓到商品结果。一般不是商品不存在，而是闲鱼对云服务器访问要求登录、验证，"
-                        "或临时限制了采集。"
-                    )
-                    st.info("可以先用下面的“粘贴商品链接直接保存素材”继续用。")
-                else:
-                    st.session_state["student_last_success_keyword"] = keyword
-                    st.success(f"搜索完成：找到 {item_count} 条结果。")
-            except Exception as exc:
-                st.error(f"搜索失败：{exc}")
-                st.info("如果浏览器要求登录或验证，请完成后再点一次搜索。")
+        if st.button("开始自动搜索", type="primary", width="stretch"):
+            if not keyword:
+                st.warning("请先输入商品词，比如：床垫")
+            else:
+                st.session_state["student_keyword"] = keyword
+                st.session_state["student_last_success_keyword"] = ""
+                try:
+                    with st.spinner("正在打开闲鱼搜索并采集前几条结果，请稍等……"):
+                        item_count, candidate_count = run_student_keyword_search_for_streamlit(keyword, limit)
+                    if item_count <= 0:
+                        st.session_state["student_last_success_keyword"] = keyword
+                        st.warning(
+                            "没有抓到商品结果。一般不是商品不存在，而是闲鱼对云服务器访问要求登录、验证，"
+                            "或临时限制了采集。请使用上面的方式 1 粘贴商品链接保存素材。"
+                        )
+                    else:
+                        st.session_state["student_last_success_keyword"] = keyword
+                        st.success(f"搜索完成：找到 {item_count} 条结果。")
+                except Exception as exc:
+                    st.error(f"搜索失败：{exc}")
+                    st.info("如果浏览器要求登录或验证，请改用上面的方式 1。")
+                    return
+
+        if keyword:
+            last_success_keyword = st.session_state.get("student_last_success_keyword")
+            if last_success_keyword and last_success_keyword != keyword:
+                st.warning(
+                    f"当前输入是“{keyword}”，但最近成功搜索的是“{last_success_keyword}”。"
+                    "请重新点击“开始自动搜索”。"
+                )
                 return
 
-    _render_manual_asset_saver(st, title_hint=keyword)
+            rows = [dict(row) for row in query_student_results(keyword)]
+            if not rows:
+                st.info("暂时没有自动搜索结果。请优先使用上面的方式 1。")
+            else:
+                st.subheader(f"查看“{keyword}”的热度结果")
+                st.caption("说明：闲鱼通常不直接展示真实销量，这里用“想要数”作为热度参考。")
 
-    if not keyword:
-        st.info("输入关键词后点击搜索。")
-        return
-
-    last_success_keyword = st.session_state.get("student_last_success_keyword")
-    if last_success_keyword and last_success_keyword != keyword:
-        st.warning(
-            f"当前输入是“{keyword}”，但最近成功搜索的是“{last_success_keyword}”。"
-            "请重新点击“开始搜索热度链接”。"
-        )
-        return
-
-    rows = [dict(row) for row in query_student_results(keyword)]
-    if not rows:
-        st.info("暂时没有自动搜索结果。可以先用上面的“粘贴商品链接直接保存素材”。")
-        return
-
-    st.subheader(f"第 3 步：查看“{keyword}”的热度结果")
-    st.caption("说明：闲鱼通常不直接展示真实销量，这里用“想要数”作为热度参考。")
-
-    for index, row in enumerate(rows[:DEFAULT_STUDENT_LIMIT], start=1):
-        with st.container(border=True):
-            cols = st.columns([1, 5, 2, 2])
-            cols[0].metric("排名", index)
-            cols[1].write(row["title"])
-            cols[1].caption(f"结果关键词：{row['keyword']}")
-            cols[2].metric("想要数", row["want_count"] if row["want_count"] is not None else "空")
-            price_text = f"¥{row['price']:.2f}" if row["price"] is not None else "空"
-            cols[3].metric("价格", price_text)
-            st.link_button("打开商品链接", row["item_url"])
-            _save_one_product_from_row(
-                st,
-                row,
-                f"student_save_{row['id']}",
-                expected_keyword=keyword,
-            )
+                for index, row in enumerate(rows[:DEFAULT_STUDENT_LIMIT], start=1):
+                    with st.container(border=True):
+                        cols = st.columns([1, 5, 2, 2])
+                        cols[0].metric("排名", index)
+                        cols[1].write(row["title"])
+                        cols[1].caption(f"结果关键词：{row['keyword']}")
+                        cols[2].metric("想要数", row["want_count"] if row["want_count"] is not None else "空")
+                        price_text = f"¥{row['price']:.2f}" if row["price"] is not None else "空"
+                        cols[3].metric("价格", price_text)
+                        st.link_button("打开商品链接", row["item_url"])
+                        _save_one_product_from_row(
+                            st,
+                            row,
+                            f"student_save_{row['id']}",
+                            expected_keyword=keyword,
+                        )
 
     last_saved_folder = st.session_state.get("last_saved_folder")
     if last_saved_folder:
         st.divider()
-        st.subheader("第 4 步：打开刚保存的素材")
-        st.write("刚保存的素材文件夹：")
+        st.subheader("刚保存的素材")
+        st.write("素材文件夹：")
         st.code(str(last_saved_folder))
-        if st.button("在访达打开素材文件夹", type="primary"):
+        if is_online_deployment():
+            st.info("线上版素材保存在服务器里。管理员可在服务器目录 /opt/xianyu-data/saved_products 查看。")
+        elif st.button("在访达打开素材文件夹", type="primary"):
             try:
                 open_folder_for_streamlit(str(last_saved_folder))
                 st.success("已打开访达。里面的“文案.txt”是文案，“images”是图片。")
             except Exception as exc:
                 st.error(f"打开失败：{exc}")
+
+
+def _render_cloud_login(st: Any) -> None:
+    """Admin page for keeping the cloud-side Xianyu browser profile logged in."""
+    st.header("云端闲鱼登录 / 验证")
+    st.caption("只给管理员用。学员不需要看这个页面。")
+
+    if not is_online_deployment():
+        st.info("当前是本地版。云端登录页主要用于阿里云服务器。")
+
+    st.warning(
+        "如果学员端自动搜索一直是 0，通常不是商品不存在，"
+        "而是闲鱼要求云服务器登录、扫码或安全验证。先在这里处理一次。"
+    )
+
+    screenshot_path = cloud_login_screenshot_path()
+    status = cloud_login_process_status()
+    status_cols = st.columns([2, 3])
+    status_cols[0].metric("登录会话状态", status)
+    if screenshot_path.exists():
+        updated_at = time.strftime(
+            "%Y-%m-%d %H:%M:%S",
+            time.localtime(screenshot_path.stat().st_mtime),
+        )
+        status_cols[1].metric("截图更新时间", updated_at)
+    else:
+        status_cols[1].metric("截图更新时间", "还没有截图")
+
+    keyword = st.text_input(
+        "用于打开闲鱼的测试关键词",
+        value="床垫",
+        help="随便填一个常见商品词即可，只是为了打开闲鱼搜索页触发登录/验证。",
+    ).strip() or "床垫"
+
+    cols = st.columns(3)
+    if cols[0].button("启动 3 分钟扫码/验证窗口", type="primary"):
+        try:
+            pid = start_cloud_login_session(keyword=keyword)
+            st.success(f"已启动云端浏览器会话（PID {pid}）。等 5-10 秒后点“刷新二维码截图”。")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"启动失败：{exc}")
+
+    if cols[1].button("刷新二维码截图"):
+        st.rerun()
+
+    if cols[2].button("登录后测试搜索"):
+        try:
+            with st.spinner("正在测试云端搜索……"):
+                item_count, _ = run_student_keyword_search_for_streamlit(keyword, 5)
+            if item_count > 0:
+                st.success(f"测试成功：{keyword} 搜到 {item_count} 条。")
+            else:
+                st.warning(
+                    "测试仍为 0。说明闲鱼仍在限制云服务器自动搜索，"
+                    "学员端请使用“粘贴商品链接保存素材”的稳定流程。"
+                )
+        except Exception as exc:
+            st.error(f"测试失败：{exc}")
+
+    if screenshot_path.exists():
+        st.subheader("扫码/验证截图")
+        st.image(str(screenshot_path), caption="如果看到登录二维码，用手机闲鱼/淘宝扫码；如果看到验证，按页面提示完成。")
+        st.info("扫码或验证完成后，等几秒钟，再点上面的“登录后测试搜索”。")
+    else:
+        st.info("还没有截图。请先点“启动 3 分钟扫码/验证窗口”。")
+
+    with st.expander("管理员说明", expanded=False):
+        st.write(
+            "这个功能是在阿里云服务器上保存闲鱼浏览器登录状态，"
+            "不需要你的 Mac 一直开着。"
+        )
+        st.write("但闲鱼可能仍会限制云服务器自动搜索，所以最终稳定兜底是：学员粘贴商品链接，一键保存文案和图片。")
+        st.code(str(screenshot_path))
 
 
 def _render_keywords(st: Any, pd: Any) -> None:
@@ -775,6 +930,8 @@ def main() -> None:
 
     if page == "学员选品助手":
         _render_student_assistant(st, pd)
+    elif page == "云端登录":
+        _render_cloud_login(st)
     elif page == "今日概览":
         _render_overview(st, pd)
     elif page == "关键词管理":
